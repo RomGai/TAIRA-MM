@@ -11,6 +11,11 @@ from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
+from agent3_qwen3vl_embedding_tool import (
+    Agent3Qwen3VLEmbeddingTool,
+    Agent3TextEmbeddingTool,
+    save_agent3_qwen3vl_embedding_cache_manifest,
+)
 from sentence_transformers import SentenceTransformer
 
 try:
@@ -465,29 +470,55 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     item_sentence_cache: Dict[str, str] = text_cache.get("items", {})
     query_sentence_cache: Dict[str, str] = text_cache.get("queries", {})
 
-    print(f"[Init] load embedding model: {args.embedding_model}")
-    emb_model = SentenceTransformer(args.embedding_model)
-
-    item_ids_cached: List[str] = []
-    item_emb_matrix: np.ndarray | None = None
-    if emb_cache_path.exists():
-        npz = np.load(emb_cache_path, allow_pickle=True)
-        item_ids_cached = [str(x) for x in npz["item_ids"].tolist()]
-        item_emb_matrix = npz["item_embeddings"].astype(np.float32, copy=False)
-
-    if item_emb_matrix is None or item_ids_cached != all_item_ids:
-        item_emb_matrix = _build_item_embedding_cache(
-            emb_model=emb_model,
-            all_item_ids=all_item_ids,
-            meta_map=meta_map,
-            item_sentence_cache=item_sentence_cache,
-            emb_cache_path=emb_cache_path,
-            embed_batch_size=args.embed_batch_size,
-            chunk_size=args.embed_chunk_size,
-            save_every_n=args.embed_save_every,
+    emb_tool: Agent3TextEmbeddingTool | Agent3Qwen3VLEmbeddingTool
+    item_emb_norm: np.ndarray
+    if args.use_qwen3_vl_embedding:
+        print(f"[Init] load multimodal embedding model: {args.qwen3_vl_embedding_model}")
+        emb_tool = Agent3Qwen3VLEmbeddingTool(
+            model_name_or_path=args.qwen3_vl_embedding_model,
+            cache_path=emb_cache_path,
+            batch_size=args.qwen3_vl_embed_batch_size,
+            attn_implementation=args.qwen3_vl_attn_implementation or None,
         )
-
-    item_emb_norm = _l2_normalize(item_emb_matrix)
+        item_payloads = {
+            iid: {
+                "text": _item_sentence(meta_map[iid]),
+                "image": str(meta_map[iid].get("imUrl", "") or ""),
+            }
+            for iid in all_item_ids
+        }
+        merged_ids, item_emb_matrix = emb_tool.build_or_update_item_embedding_cache(item_payloads)
+        if merged_ids != all_item_ids:
+            remapped = {iid: idx for idx, iid in enumerate(merged_ids)}
+            ordered_idx = [remapped[iid] for iid in all_item_ids if iid in remapped]
+            item_emb_matrix = item_emb_matrix[np.array(ordered_idx)]
+        item_emb_norm = _l2_normalize(item_emb_matrix)
+        save_agent3_qwen3vl_embedding_cache_manifest(
+            cache_dir / "agent3_qwen3_vl_embedding_manifest.json",
+            model_name_or_path=args.qwen3_vl_embedding_model,
+            cache_path=emb_cache_path,
+            item_count=len(all_item_ids),
+        )
+    else:
+        print(f"[Init] load text embedding model: {args.embedding_model}")
+        emb_tool = Agent3TextEmbeddingTool(
+            model_name_or_path=args.embedding_model,
+            cache_path=emb_cache_path,
+            batch_size=args.embed_batch_size,
+        )
+        item_texts = {}
+        for iid in all_item_ids:
+            sentence = item_sentence_cache.get(iid)
+            if not sentence:
+                sentence = _item_sentence(meta_map[iid])
+                item_sentence_cache[iid] = sentence
+            item_texts[iid] = sentence
+        merged_ids, item_emb_matrix = emb_tool.build_or_update_item_embedding_cache(item_texts)
+        if merged_ids != all_item_ids:
+            remapped = {iid: idx for idx, iid in enumerate(merged_ids)}
+            ordered_idx = [remapped[iid] for iid in all_item_ids if iid in remapped]
+            item_emb_matrix = item_emb_matrix[np.array(ordered_idx)]
+        item_emb_norm = _l2_normalize(item_emb_matrix)
     global_db = GlobalItemDB(args.global_db)
     history_db = UserHistoryLogDB(args.history_db)
     vl_extractor = Qwen3VLExtractor(model_name=args.vl_model) if args.enable_vl_profiling else None
@@ -523,7 +554,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         filtered_idx = [item_id_to_index[iid] for iid in filtered_item_ids]
         filtered_emb = item_emb_norm[np.array(filtered_idx)]
 
-        q_emb = _encode_texts(emb_model, [q_sentence], batch_size=1, prompt_name="query").astype(np.float32, copy=False)
+        q_emb = emb_tool.embed_query_texts([q_sentence]).astype(np.float32, copy=False)
         q_emb_norm = q_emb / np.clip(np.linalg.norm(q_emb, axis=1, keepdims=True), 1e-12, None)
         sim_matrix = np.matmul(filtered_emb, q_emb_norm[0])
         rank_indices = np.argsort(-sim_matrix)
@@ -659,6 +690,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--query-csv", default="data/amazon_beauty/query_data1.csv")
     parser.add_argument("--filtered-meta-jsonl", default="data/amazon_beauty/meta_Beauty.filtered.jsonl")
     parser.add_argument("--embedding-model", default="Qwen/Qwen3-Embedding-0.6B")
+    parser.add_argument("--use-qwen3-vl-embedding", action="store_true", help="启用Qwen3-VL多模态embedding进行Agent3相似度召回。")
+    parser.add_argument("--qwen3-vl-embedding-model", default="Qwen/Qwen3-VL-Embedding-2B")
+    parser.add_argument("--qwen3-vl-embed-batch-size", type=int, default=8)
+    parser.add_argument("--qwen3-vl-attn-implementation", default="")
     parser.add_argument("--embed-batch-size", type=int, default=64)
     parser.add_argument("--embed-chunk-size", type=int, default=20000)
     parser.add_argument("--embed-save-every", type=int, default=20000)
