@@ -32,6 +32,7 @@ from item_profiler_agents import (
     expand_pos_neg_rows,
     load_item_desc_tsv,
 )
+from orchestration_agent import PipelineOrchestratorAgent
 
 
 def _collect_all_labeled_history_rows(
@@ -134,6 +135,7 @@ def _build_user_sample_progress(rows: List[Dict[str, Any]]) -> Dict[str, Dict[st
 
 def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
     from intent_dual_recall_agent import GlobalHistoryAccessor, Qwen3RouterLLM, RoutingRecallAgent
+    from dynamic_reasoning_ranking_agent import run_module3
 
     item_map = load_item_desc_tsv(args.item_desc_tsv)
     fallback_item_map: Dict[str, Dict[str, str]] = {}
@@ -151,196 +153,268 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
     run_out_dir = Path(args.profiler_run_out_dir)
     run_out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Agent 1: all candidate items
     candidate_meta_records: List[Dict[str, Any]] = []
     candidate_profile_records: List[Dict[str, Any]] = []
-    all_item_ids = list(item_map.keys())
-    print(f"[Agent 1] Processing all items: {len(all_item_ids)}")
-    for item_idx, item_id in enumerate(all_item_ids, start=1):
-        meta = item_map[item_id]
-        item = ItemProfileInput(
-            item_id=item_id,
-            title=f"item_{item_id}",
-            detail_text=meta.get("summary", "") or "",
-            main_image=meta.get("image", ""),
-            detail_images=[],
-            category_hint=args.category_hint,
-        )
-        candidate_meta_records.append(asdict(item))
-
-        profile = candidate_profiler.global_db.get_profile(item_id)
-        profile_source = "global_db_reused"
-        if profile is None:
-            profile = candidate_profiler.profile_and_store(item)
-            profile_source = "newly_profiled"
-
-        candidate_profile_records.append(
-            {
-                "item_id": item_id,
-                "source": "candidate",
-                "profile_source": profile_source,
-                "profile": profile,
-            }
-        )
-        print(
-            f"[Agent 1][Item Progress] {item_idx}/{len(all_item_ids)} "
-            f"{_progress_bar(item_idx, len(all_item_ids))} item_id={item_id} source={profile_source}"
-        )
-
-    # Agent 2: all users' labeled sequences
-    all_history_rows = _collect_all_labeled_history_rows(
-        user_pairs_tsv_path=args.user_pairs_tsv,
-        user_items_negs_path=args.user_items_negs_tsv,
-        include_negative=not bool(getattr(args, "positive_history_only", False)),
-    )
     history_meta_records: List[Dict[str, Any]] = []
     history_profile_records: List[Dict[str, Any]] = []
-    print(f"[Agent 2] Processing all labeled history rows: {len(all_history_rows)}")
-    user_sample_progress = _build_user_sample_progress(all_history_rows)
-    total_users_with_history = len(user_sample_progress)
-    processed_user_ids: set[str] = set()
+    all_item_ids = list(item_map.keys())
+    all_history_rows: List[Dict[str, Any]] = []
+    all_user_ids: List[str] = []
+    intent_outputs: List[Path] = []
 
-    for row_idx, row in enumerate(all_history_rows, start=1):
-        user_id = str(row["user_id"])
-        processed_user_ids.add(user_id)
-        item_id = str(row["item_id"])
-        timestamp_raw = row.get("timestamp")
-        timestamp: Optional[int] = None if timestamp_raw is None else int(timestamp_raw)
-        meta = item_map.get(item_id) or fallback_item_map.get(item_id, {"image": "", "summary": ""})
-
-        hist_item = HistoryItemProfileInput(
-            item_id=item_id,
-            title=f"item_{item_id}",
-            detail_text=meta.get("summary", "") or "",
-            main_image=meta.get("image", ""),
-            detail_images=[],
-            category_hint=args.category_hint,
-            user_id=user_id,
-            behavior=str(row["behavior"]),
-            timestamp=timestamp,
-        )
-        history_meta_records.append(asdict(hist_item))
-
-        profile = candidate_profiler.global_db.get_profile(item_id)
-        profile_source = "global_db_reused"
-        if profile is None:
-            profile = candidate_profiler.profile_and_store(
-                ItemProfileInput(
-                    item_id=item_id,
-                    title=hist_item.title,
-                    detail_text=hist_item.detail_text,
-                    main_image=hist_item.main_image,
-                    detail_images=hist_item.detail_images,
-                    category_hint=hist_item.category_hint,
-                )
+    def _run_agent1() -> None:
+        print(f"[Agent 1] Processing all items: {len(all_item_ids)}")
+        for item_idx, item_id in enumerate(all_item_ids, start=1):
+            meta = item_map[item_id]
+            item = ItemProfileInput(
+                item_id=item_id,
+                title=f"item_{item_id}",
+                detail_text=meta.get("summary", "") or "",
+                main_image=meta.get("image", ""),
+                detail_images=[],
+                category_hint=args.category_hint,
             )
-            profile_source = "newly_profiled"
+            candidate_meta_records.append(asdict(item))
 
-        profile["behavior"] = hist_item.behavior
-        profile["timestamp"] = hist_item.timestamp
-        profile["user_id"] = hist_item.user_id
+            profile = candidate_profiler.global_db.get_profile(item_id)
+            profile_source = "global_db_reused"
+            if profile is None:
+                profile = candidate_profiler.profile_and_store(item)
+                profile_source = "newly_profiled"
 
-        if not history_profiler.history_db.exists(
-            user_id=hist_item.user_id,
-            item_id=hist_item.item_id,
-            behavior=hist_item.behavior,
-            timestamp=hist_item.timestamp,
-        ):
-            history_profiler.history_db.insert(
+            candidate_profile_records.append(
+                {
+                    "item_id": item_id,
+                    "source": "candidate",
+                    "profile_source": profile_source,
+                    "profile": profile,
+                }
+            )
+            print(
+                f"[Agent 1][Item Progress] {item_idx}/{len(all_item_ids)} "
+                f"{_progress_bar(item_idx, len(all_item_ids))} item_id={item_id} source={profile_source}"
+            )
+
+    def _run_agent2() -> None:
+        nonlocal all_history_rows
+        all_history_rows = _collect_all_labeled_history_rows(
+            user_pairs_tsv_path=args.user_pairs_tsv,
+            user_items_negs_path=args.user_items_negs_tsv,
+            include_negative=not bool(getattr(args, "positive_history_only", False)),
+        )
+        print(f"[Agent 2] Processing all labeled history rows: {len(all_history_rows)}")
+        user_sample_progress = _build_user_sample_progress(all_history_rows)
+        total_users_with_history = len(user_sample_progress)
+        processed_user_ids: set[str] = set()
+
+        for row_idx, row in enumerate(all_history_rows, start=1):
+            user_id = str(row["user_id"])
+            processed_user_ids.add(user_id)
+            item_id = str(row["item_id"])
+            timestamp_raw = row.get("timestamp")
+            timestamp: Optional[int] = None if timestamp_raw is None else int(timestamp_raw)
+            meta = item_map.get(item_id) or fallback_item_map.get(item_id, {"image": "", "summary": ""})
+
+            hist_item = HistoryItemProfileInput(
+                item_id=item_id,
+                title=f"item_{item_id}",
+                detail_text=meta.get("summary", "") or "",
+                main_image=meta.get("image", ""),
+                detail_images=[],
+                category_hint=args.category_hint,
+                user_id=user_id,
+                behavior=str(row["behavior"]),
+                timestamp=timestamp,
+            )
+            history_meta_records.append(asdict(hist_item))
+
+            profile = candidate_profiler.global_db.get_profile(item_id)
+            profile_source = "global_db_reused"
+            if profile is None:
+                profile = candidate_profiler.profile_and_store(
+                    ItemProfileInput(
+                        item_id=item_id,
+                        title=hist_item.title,
+                        detail_text=hist_item.detail_text,
+                        main_image=hist_item.main_image,
+                        detail_images=hist_item.detail_images,
+                        category_hint=hist_item.category_hint,
+                    )
+                )
+                profile_source = "newly_profiled"
+
+            profile["behavior"] = hist_item.behavior
+            profile["timestamp"] = hist_item.timestamp
+            profile["user_id"] = hist_item.user_id
+
+            if not history_profiler.history_db.exists(
                 user_id=hist_item.user_id,
                 item_id=hist_item.item_id,
                 behavior=hist_item.behavior,
                 timestamp=hist_item.timestamp,
-                profile=profile,
+            ):
+                history_profiler.history_db.insert(
+                    user_id=hist_item.user_id,
+                    item_id=hist_item.item_id,
+                    behavior=hist_item.behavior,
+                    timestamp=hist_item.timestamp,
+                    profile=profile,
+                )
+                history_write_status = "inserted"
+            else:
+                history_write_status = "already_exists"
+
+            history_profile_records.append(
+                {
+                    "user_id": user_id,
+                    "item_id": item_id,
+                    "timestamp": timestamp,
+                    "source": "history",
+                    "profile_source": profile_source,
+                    "history_write_status": history_write_status,
+                    "profile": profile,
+                }
             )
-            history_write_status = "inserted"
-        else:
-            history_write_status = "already_exists"
+            user_sample_progress[user_id]["done"] += 1
+            user_done = user_sample_progress[user_id]["done"]
+            user_total = user_sample_progress[user_id]["total"]
+            print(
+                f"[Agent 2][User Progress] user {len(processed_user_ids)}/{total_users_with_history} "
+                f"(user_id={user_id}) sample {user_done}/{user_total} {_progress_bar(user_done, user_total)} | "
+                f"overall {row_idx}/{len(all_history_rows)}"
+            )
 
-        history_profile_records.append(
-            {
-                "user_id": user_id,
-                "item_id": item_id,
-                "timestamp": timestamp,
-                "source": "history",
-                "profile_source": profile_source,
-                "history_write_status": history_write_status,
-                "profile": profile,
-            }
-        )
+    def _load_all_user_ids() -> None:
+        nonlocal all_user_ids
+        conn = sqlite3.connect(str(args.history_db))
+        try:
+            user_rows = conn.execute("SELECT DISTINCT user_id FROM user_history_profiles").fetchall()
+        finally:
+            conn.close()
+        all_user_ids = [str(r[0]) for r in user_rows]
 
-        user_sample_progress[user_id]["done"] += 1
-        user_done = user_sample_progress[user_id]["done"]
-        user_total = user_sample_progress[user_id]["total"]
-        print(
-            f"[Agent 2][User Progress] user {len(processed_user_ids)}/{total_users_with_history} "
-            f"(user_id={user_id}) sample {user_done}/{user_total} {_progress_bar(user_done, user_total)} | "
-            f"overall {row_idx}/{len(all_history_rows)}"
-        )
-
-    _write_jsonl(run_out_dir / "candidate_meta.jsonl", candidate_meta_records)
-    _write_jsonl(run_out_dir / "history_meta.jsonl", history_meta_records)
-    _write_jsonl(run_out_dir / "candidate_profiles.jsonl", candidate_profile_records)
-    _write_jsonl(run_out_dir / "history_profiles.jsonl", history_profile_records)
-    _export_sqlite_table_as_jsonl(
-        args.global_db,
-        "global_item_features",
-        run_out_dir / "global_item_features_snapshot.jsonl",
-    )
-    _export_sqlite_table_as_jsonl(
-        args.history_db,
-        "user_history_profiles",
-        run_out_dir / "user_history_profiles_snapshot.jsonl",
-    )
-
-    # Agent 3: run for every user in history db; outputs saved to intent_output_dir
-    conn = sqlite3.connect(str(args.history_db))
-    try:
-        user_rows = conn.execute("SELECT DISTINCT user_id FROM user_history_profiles").fetchall()
-    finally:
-        conn.close()
-    all_user_ids = [str(r[0]) for r in user_rows]
-
-    print(f"[Agent 3] Running intent dual recall for all users: {len(all_user_ids)}")
     router = Qwen3RouterLLM(model_name=args.text_model)
     accessor = GlobalHistoryAccessor(args.global_db, args.history_db)
     recall_agent = RoutingRecallAgent(llm=router, accessor=accessor)
 
-    for user_idx, user_id in enumerate(all_user_ids, start=1):
-        out = recall_agent.run(
-            user_id=user_id,
-            query=args.query,
-            min_candidate_items=args.min_candidate_items,
-            max_candidate_items=args.max_candidate_items,
-            max_history_rows=args.max_history_rows,
-            filter_candidates_by_item_type=bool(getattr(args, "filter_candidates_by_item_type", True)),
-            candidate_item_ids_scope=getattr(args, "candidate_item_ids_scope", None),
-            save_output=True,
-            output_dir=args.intent_output_dir,
+    def _run_agent3_batch() -> None:
+        nonlocal intent_outputs
+        if not all_user_ids:
+            _load_all_user_ids()
+        print(f"[Agent 3] Running intent dual recall for all users: {len(all_user_ids)}")
+        for user_idx, user_id in enumerate(all_user_ids, start=1):
+            out = recall_agent.run(
+                user_id=user_id,
+                query=args.query,
+                min_candidate_items=args.min_candidate_items,
+                max_candidate_items=args.max_candidate_items,
+                max_history_rows=args.max_history_rows,
+                filter_candidates_by_item_type=bool(getattr(args, "filter_candidates_by_item_type", True)),
+                candidate_item_ids_scope=getattr(args, "candidate_item_ids_scope", None),
+                save_output=True,
+                output_dir=args.intent_output_dir,
+            )
+            print(
+                f"[Agent 3] user={user_id}, candidate_items={len(out.candidate_items)}, "
+                f"history_rows={len(out.query_relevant_history)} | "
+                f"progress {user_idx}/{len(all_user_ids)} {_progress_bar(user_idx, len(all_user_ids))}"
+            )
+        intent_outputs = _list_saved_agent3_outputs(args.intent_output_dir)
+
+    def _run_agent45_batch() -> None:
+        nonlocal intent_outputs
+        if not intent_outputs:
+            intent_outputs = _list_saved_agent3_outputs(args.intent_output_dir)
+        print(f"[Agent 4/5] Running module-3 for all agent3 outputs: {len(intent_outputs)}")
+        for p in intent_outputs:
+            payload = json.loads(p.read_text(encoding="utf-8"))
+            run_module3(
+                intent_dual_recall_output=payload,
+                model_name=args.text_model,
+                top_n=args.top_n,
+                disable_must_avoid=bool(getattr(args, "positive_history_only", False)),
+                disable_must_have=bool(getattr(args, "disable_must_have", False)),
+                disable_prediction_bonus=bool(getattr(args, "disable_prediction_bonus", False)),
+                save_output=True,
+                output_dir=args.dynamic_output_dir,
+            )
+
+    def _run_agent3_agent45_stream() -> None:
+        nonlocal intent_outputs
+        if not all_user_ids:
+            _load_all_user_ids()
+        print(f"[Orchestrator] Streaming Agent3 -> Agent4/5 per user: {len(all_user_ids)}")
+        for user_idx, user_id in enumerate(all_user_ids, start=1):
+            out = recall_agent.run(
+                user_id=user_id,
+                query=args.query,
+                min_candidate_items=args.min_candidate_items,
+                max_candidate_items=args.max_candidate_items,
+                max_history_rows=args.max_history_rows,
+                filter_candidates_by_item_type=bool(getattr(args, "filter_candidates_by_item_type", True)),
+                candidate_item_ids_scope=getattr(args, "candidate_item_ids_scope", None),
+                save_output=True,
+                output_dir=args.intent_output_dir,
+            )
+            out_file = Path(args.intent_output_dir) / f"{user_id}_intent_dual_recall_output.json"
+            if out_file.exists():
+                intent_outputs.append(out_file)
+                payload = json.loads(out_file.read_text(encoding="utf-8"))
+                run_module3(
+                    intent_dual_recall_output=payload,
+                    model_name=args.text_model,
+                    top_n=args.top_n,
+                    disable_must_avoid=bool(getattr(args, "positive_history_only", False)),
+                    disable_must_have=bool(getattr(args, "disable_must_have", False)),
+                    disable_prediction_bonus=bool(getattr(args, "disable_prediction_bonus", False)),
+                    save_output=True,
+                    output_dir=args.dynamic_output_dir,
+                )
+            print(
+                f"[Orchestrator] user={user_id} done | candidate_items={len(out.candidate_items)} "
+                f"| progress {user_idx}/{len(all_user_ids)} {_progress_bar(user_idx, len(all_user_ids))}"
+            )
+
+    def _persist_profile_artifacts() -> None:
+        _write_jsonl(run_out_dir / "candidate_meta.jsonl", candidate_meta_records)
+        _write_jsonl(run_out_dir / "history_meta.jsonl", history_meta_records)
+        _write_jsonl(run_out_dir / "candidate_profiles.jsonl", candidate_profile_records)
+        _write_jsonl(run_out_dir / "history_profiles.jsonl", history_profile_records)
+        _export_sqlite_table_as_jsonl(
+            args.global_db,
+            "global_item_features",
+            run_out_dir / "global_item_features_snapshot.jsonl",
         )
-        print(
-            f"[Agent 3] user={user_id}, candidate_items={len(out.candidate_items)}, "
-            f"history_rows={len(out.query_relevant_history)} | "
-            f"progress {user_idx}/{len(all_user_ids)} {_progress_bar(user_idx, len(all_user_ids))}"
+        _export_sqlite_table_as_jsonl(
+            args.history_db,
+            "user_history_profiles",
+            run_out_dir / "user_history_profiles_snapshot.jsonl",
         )
 
-    # Agent 4+5: iterate every agent3 output file automatically
-    from dynamic_reasoning_ranking_agent import run_module3
+    orchestrator = PipelineOrchestratorAgent()
+    plan = orchestrator.plan(
+        profile=str(getattr(args, "orchestration_profile", "standard")),
+        hints={"needs_fresh_item_profiles": not bool(getattr(args, "skip_agent1_if_db_exists", False))},
+    )
+    print(f"[Orchestrator] profile={plan.profile}, stages={plan.stages}, notes={plan.notes}")
 
-    intent_outputs = _list_saved_agent3_outputs(args.intent_output_dir)
-    print(f"[Agent 4/5] Running module-3 for all agent3 outputs: {len(intent_outputs)}")
-    for p in intent_outputs:
-        payload = json.loads(p.read_text(encoding="utf-8"))
-        run_module3(
-            intent_dual_recall_output=payload,
-            model_name=args.text_model,
-            top_n=args.top_n,
-            disable_must_avoid=bool(getattr(args, "positive_history_only", False)),
-            disable_must_have=bool(getattr(args, "disable_must_have", False)),
-            disable_prediction_bonus=bool(getattr(args, "disable_prediction_bonus", False)),
-            save_output=True,
-            output_dir=args.dynamic_output_dir,
-        )
+    for stage in plan.stages:
+        if stage == "agent1":
+            if bool(getattr(args, "skip_agent1_if_db_exists", False)) and Path(args.global_db).exists():
+                print("[Orchestrator] Skip Agent1 due to --skip-agent1-if-db-exists and existing global DB.")
+                continue
+            _run_agent1()
+        elif stage == "agent2":
+            _run_agent2()
+            _persist_profile_artifacts()
+        elif stage == "agent3_batch":
+            _run_agent3_batch()
+        elif stage == "agent45_batch":
+            _run_agent45_batch()
+        elif stage == "agent3_agent45_stream":
+            _run_agent3_agent45_stream()
+        elif stage == "bundle":
+            pass
 
     bundle_file = _bundle_paths(
         args.bundle_output,
@@ -354,6 +428,8 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
     )
 
     return {
+        "orchestration_profile": plan.profile,
+        "orchestration_stages": plan.stages,
         "items_processed": len(all_item_ids),
         "history_rows_processed": len(all_history_rows),
         "users_processed": len(all_user_ids),
@@ -390,6 +466,17 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--max-candidate-items", type=int, default=200)
     parser.add_argument("--max-history-rows", type=int, default=200)
     parser.add_argument("--top-n", type=int, default=21)
+    parser.add_argument(
+        "--orchestration-profile",
+        choices=["standard", "user_stream", "minimal_refresh"],
+        default="standard",
+        help="Execution planning profile decided by the orchestration agent.",
+    )
+    parser.add_argument(
+        "--skip-agent1-if-db-exists",
+        action="store_true",
+        help="Allow orchestration agent to skip Agent1 when global DB already exists.",
+    )
     parser.add_argument(
         "--disable-agent3-item-type-filter",
         action="store_true",
