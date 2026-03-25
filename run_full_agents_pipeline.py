@@ -32,7 +32,7 @@ from item_profiler_agents import (
     expand_pos_neg_rows,
     load_item_desc_tsv,
 )
-from orchestration_agent import PipelineOrchestratorAgent
+from orchestration_agent import PipelineOrchestratorAgent, QwenOrchestrationLLM
 
 
 def _collect_all_labeled_history_rows(
@@ -391,7 +391,10 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
             run_out_dir / "user_history_profiles_snapshot.jsonl",
         )
 
-    orchestrator = PipelineOrchestratorAgent()
+    llm_planner = None
+    if bool(getattr(args, "orchestration_use_llm", False)):
+        llm_planner = QwenOrchestrationLLM(model_name=str(getattr(args, "orchestration_llm_model", "Qwen/Qwen3-8B")))
+    orchestrator = PipelineOrchestratorAgent(llm_planner=llm_planner)
     plan = orchestrator.plan(
         profile=str(getattr(args, "orchestration_profile", "standard")),
         hints={"needs_fresh_item_profiles": not bool(getattr(args, "skip_agent1_if_db_exists", False))},
@@ -476,6 +479,16 @@ def build_argparser() -> argparse.ArgumentParser:
         "--skip-agent1-if-db-exists",
         action="store_true",
         help="Allow orchestration agent to skip Agent1 when global DB already exists.",
+    )
+    parser.add_argument(
+        "--orchestration-use-llm",
+        action="store_true",
+        help="Use LLM-based orchestration planning (fallback to heuristic plan on failure).",
+    )
+    parser.add_argument(
+        "--orchestration-llm-model",
+        default="Qwen/Qwen3-8B",
+        help="LLM model name for orchestration planning.",
     )
     parser.add_argument(
         "--disable-agent3-item-type-filter",
